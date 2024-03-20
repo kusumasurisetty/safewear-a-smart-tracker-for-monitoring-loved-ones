@@ -1,0 +1,277 @@
+#include <SPI.h>
+#include <LoRa.h>
+#include <Wire.h>
+#include <TinyGPS++.h>
+
+
+TinyGPSPlus gps;
+//defining pins of tx module
+#define GPS_BAUDRATE 9600
+#define ss 5
+#define rst 14
+#define dio0 2
+
+const int buttonPin = 4; 
+int buttonState = 0;
+
+const int MPU_addr = 0x68;  // I2C address of the MPU-6050
+int16_t AcX, AcY, AcZ, Tmp, GyX, GyY, GyZ;
+float ax = 0, ay = 0, az = 0, gx = 0, gy = 0, gz = 0;
+boolean fall = false;      //stores if a fall has occurred
+boolean trigger1 = false;  //stores if first trigger (lower threshold) has occurred
+boolean trigger2 = false;  //stores if second trigger (upper threshold) has occurred
+boolean trigger3 = false;  //stores if third trigger (orientation change) has occurred
+byte trigger1count = 0;    //stores the counts past since trigger 1 was set true
+byte trigger2count = 0;    //stores the counts past since trigger 2 was set true
+byte trigger3count = 0;    //stores the counts past since trigger 3 was set true
+int angleChange = 0;
+int counter = 0;
+
+
+void setup() {
+  // put your setup code here, to run once:
+  //Initialising GPS Neo6M module 
+  Serial.begin(9600);
+  Serial2.begin(GPS_BAUDRATE);
+  Serial.println(F("ESP32 - GPS module"));
+
+
+  /* This is the initialisation of MPU6050*/
+  Serial.begin(9600);
+  Wire.begin();
+  Wire.beginTransmission(MPU_addr);
+  Wire.write(0x6B);  //// PWR_MGMT_1 register
+  Wire.write(0);     // set to zero (wakes up the MPU-6050
+  Wire.endTransmission(true);
+
+
+  //initializing the serial monitor
+  Serial.begin(9600);
+  while (!Serial)
+    ;
+  Serial.println("Lora sender");
+  LoRa.setPins(ss, rst, dio0);
+
+  while (!LoRa.begin(433E6)) {
+    Serial.println(".");
+    delay(500);
+  }
+
+  LoRa.setSyncWord(0xF3);
+  //Change sync word (0xF3) to match the receiver
+  // The sync word assures you don't get LoRa messages from other LoRa transceivers
+  // ranges from 0-0xFF
+  Serial.println("LoRa initialised successfully!!");
+  pinMode(buttonPin, INPUT);
+
+
+}
+
+void loop() {
+
+buttonState = digitalRead(buttonPin);
+
+ if(buttonState == LOW)
+ {
+  Serial.print("Sending packet : ");
+ // Serial.println(counter);
+
+  //send to lora packet to reciver
+  
+  for(int j=0;j<=5;j++)
+  {
+  LoRa.beginPacket();
+  LoRa.print("panic need help !!!!!!!");
+  LoRa.endPacket();
+ // LoRa.print(counter);
+  }
+  
+
+  counter++;
+  delay(3000);
+ }
+
+
+
+
+
+  mpu_read();
+  ax = (AcX - 2050) / 16384.00;
+  ay = (AcY - 77) / 16384.00;
+  az = (AcZ - 1947) / 16384.00;
+  gx = (GyX + 270) / 131.07;
+  gy = (GyY - 351) / 131.07;
+  gz = (GyZ + 136) / 131.07;
+
+  // calculating Amplitute vactor for 3 axis
+  float Raw_Amp = pow(pow(ax, 2) + pow(ay, 2) + pow(az, 2), 0.5);
+  int Amp = Raw_Amp * 10;  // Mulitiplied by 10 bcz values are between 0 to 1
+  Serial.println(Amp);
+  if (Amp <= 2 && trigger2 == false)  //if AM breaks lower threshold (0.4g)
+  {
+    trigger1 = true;
+    Serial.println("trigger 1 is activated");
+  }
+  if (trigger1 == true) {
+    trigger1count++;
+    if (Amp >= 12) {
+      trigger2 = true;
+      Serial.println("trigger 2 is activated");
+      trigger1 = false;
+      trigger1count = 0;
+    }
+  }
+  if (trigger2 == true) {
+    trigger2count++;
+    angleChange = pow(pow(gx, 2) + pow(gy, 2) + pow(gz, 2), 0.5);
+    Serial.println(angleChange);
+    if (angleChange >= 30 && angleChange <= 400) {  //if orientation changes by between 80-100 degrees
+      trigger3 = true;
+      trigger2 = false;
+      trigger2count = 0;
+      Serial.println(angleChange);
+      Serial.println("TRIGGER 3 ACTIVATED");
+    }
+  }
+  if (trigger3 == true) {
+    trigger3count++;
+    if (trigger3count >= 10) {
+      angleChange = pow(pow(gx, 2) + pow(gy, 2) + pow(gz, 2), 0.5);
+      delay(10);
+      Serial.println(angleChange);
+      if ((angleChange >= 0) && (angleChange <= 10)) {  //if orientation changes remains between 0-10 degrees
+        fall = true;
+        trigger3 = false;
+        trigger3count = 0;
+        Serial.println(angleChange);
+      } else {  //user regained normal orientation
+        trigger3 = false;
+        trigger3count = 0;
+        Serial.println("TRIGGER 3 DEACTIVATED");
+      }
+    }
+  }
+  if (fall == true) {  //in event of a fall detection
+    Serial.println("FALL DETECTED");
+    for(int i=0;i<5;i++)
+  {
+   LoRa.beginPacket();
+   LoRa.print("ALERT!!! The person has fallen");
+   LoRa.endPacket();
+   gps_loc();
+   delay(1000);
+  }
+
+
+    fall = false;
+  }
+  if (trigger2count >= 6) {  //allow 0.5s for orientation change
+    trigger2 = false;
+    trigger2count = 0;
+    Serial.println("TRIGGER 2 DEACTIVATED");
+  }
+  if (trigger1count >= 6) {  //allow 0.5s for AM to break upper threshold
+    trigger1 = false;
+    trigger1count = 0;
+    Serial.println("TRIGGER 1 DEACTIVATED");
+  }
+  delay(100);
+
+  gps_loc();
+  // put your main code here, to run repeatedly:
+  // Serial.print("Sending packet : ");
+  // Serial.println(counter);
+
+  // //send to lora packet to reciver
+  // LoRa.beginPacket();
+  // LoRa.print("hello world");
+  // LoRa.print(counter);
+  // LoRa.endPacket();
+
+  // counter++;
+  // delay(3000);
+}
+
+void mpu_read() {
+  Wire.beginTransmission(MPU_addr);
+  Wire.write(0x3B);  // starting with register 0x3B (ACCEL_XOUT_H)
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU_addr, 14, true);  // request a total of 14 registers
+  AcX = Wire.read() << 8 | Wire.read();  // 0x3B (ACCEL_XOUT_H) & 0x3C (ACCEL_XOUT_L)
+  AcY = Wire.read() << 8 | Wire.read();  // 0x3D (ACCEL_YOUT_H) & 0x3E (ACCEL_YOUT_L)
+  AcZ = Wire.read() << 8 | Wire.read();  // 0x3F (ACCEL_ZOUT_H) & 0x40 (ACCEL_ZOUT_L)
+  Tmp = Wire.read() << 8 | Wire.read();  // 0x41 (TEMP_OUT_H) & 0x42 (TEMP_OUT_L)
+  GyX = Wire.read() << 8 | Wire.read();  // 0x43 (GYRO_XOUT_H) & 0x44 (GYRO_XOUT_L)
+  GyY = Wire.read() << 8 | Wire.read();  // 0x45 (GYRO_YOUT_H) & 0x46 (GYRO_YOUT_L)
+  GyZ = Wire.read() << 8 | Wire.read();  // 0x47 (GYRO_ZOUT_H) & 0x48 (GYRO_ZOUT_L)
+}
+void gps_loc()
+{
+  if (Serial2.available() > 0) {
+    if (gps.encode(Serial2.read())) {
+      if (gps.location.isValid()) 
+      {
+        LoRa.beginPacket();
+        //LoRa.print("Everything is alright!");
+        LoRa.print("- GPS Parameters -");
+        LoRa.endPacket();
+        //Serial.print(F("- latitude: "));
+        LoRa.beginPacket();
+        LoRa.print("- latitude:");
+        //Serial.println(gps.location.lat());
+        
+        LoRa.print(gps.location.lat());
+        LoRa.endPacket();
+        //Serial.print(F("- longitude: "));
+        LoRa.beginPacket();
+        LoRa.print("- longitude: ");
+        //Serial.println(gps.location.lng());
+        LoRa.print(gps.location.lng());
+        LoRa.endPacket();
+
+        // Serial.print(F("- altitude: "));
+        // if (gps.altitude.isValid())
+        //   Serial.println(gps.altitude.meters());
+        // else
+        //   Serial.println(F("INVALID"));
+      } else 
+      {
+        LoRa.beginPacket();
+        LoRa.print("- location: INVALID");
+        LoRa.endPacket();
+      }
+
+      // Serial.print(F("- speed: "));
+      // if (gps.speed.isValid()) {
+      //   Serial.print(gps.speed.kmph());
+      //   Serial.println(F(" km/h"));
+      // } else {
+      //   Serial.println(F("INVALID"));
+      // }
+
+      // Serial.print(F("- GPS date&time: "));
+      // if (gps.date.isValid() && gps.time.isValid()) {
+        
+      //   Serial.print(gps.date.year());
+      //   Serial.print(F("-"));
+      //   Serial.print(gps.date.month());
+      //   Serial.print(F("-"));
+      //   Serial.print(gps.date.day());
+      //   Serial.print(F(" "));
+      //   Serial.print(gps.time.hour());
+      //   Serial.print(F(":"));
+      //   Serial.print(gps.time.minute());
+      //   Serial.print(F(":"));
+      //   Serial.println(gps.time.second());
+      // } else {
+      //   Serial.println(F("INVALID"));
+      // }
+
+      Serial.println();
+      delay(1000);
+    }
+  }
+
+  if (millis() > 5000 && gps.charsProcessed() < 10)
+    Serial.println(F("No GPS data received: check wiring"));
+}
